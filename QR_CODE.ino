@@ -267,26 +267,13 @@ void handleSave() {
   prefs.putString("pass", prov_pass);
   prefs.end();
 
-  // respond to client
-  String resp = "<html><body><h3>Credentials saved.</h3>"
-                "<p>Device will attempt to connect to <b>" + prov_ssid + "</b>.<br>"
-                "Please wait ~30 seconds and check the device screen for the QR code.</p>"
-                "</body></html>";
-  server.send(200, "text/html", resp);
+  // respond to client - redirect to product page
+  String redirect = String("http://") + apIP.toString() + "/product";
+  server.sendHeader("Location", redirect, true);
+  server.send(302, "text/plain", "");
 
-  // begin WiFi connect sequence (non-blocking)
-  // stop captive portal services before switching to STA
-  if (captiveRunning) {
-    dnsServer.stop();
-    server.stop();
-    captiveRunning = false;
-  }
-
-  // stop AP and switch to station mode
-  WiFi.softAPdisconnect(true);
-  delay(200);
-
-  WiFi.mode(WIFI_STA);
+  // begin WiFi connect sequence (non-blocking) but keep AP running
+  WiFi.mode(WIFI_AP_STA); // dual mode - keep AP + start STA
   WiFi.begin(prov_ssid.c_str(), prov_pass.c_str());
   Serial.println("WiFi.begin() called (attempting station connection)");
 }
@@ -412,6 +399,13 @@ void handleAddProduct() {
   // Show payment QR on TFT
   showPaymentQRCode(lastProductName, lastProductPrice);
 
+  // Now close the captive portal since we're done
+  if (captiveRunning) {
+    dnsServer.stop();
+    captiveRunning = false;
+    Serial.println("Captive portal closed after product setup");
+  }
+
   // Respond to client with simple success page
   String resp = "<html><body><h3>Verified</h3><p>Price: " + String(price, 2) + "</p>"
                 "<p>Check the device screen for the payment QR.</p></body></html>";
@@ -442,6 +436,8 @@ void setupAPandCaptivePortal() {
   // webserver handlers
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/product", HTTP_GET, handleProductRoot);
+  server.on("/add", HTTP_POST, handleAddProduct);
   server.on("/generate_204", HTTP_ANY, handleGenerate204);        // Android
   server.on("/hotspot-detect.html", HTTP_ANY, handleHotspotDetect); // iOS
   server.on("/ncsi.txt", HTTP_ANY, handleNcsi);                 // Windows
@@ -519,50 +515,22 @@ void loop() {
     server.handleClient();
   }
 
-  // If credentials were posted, check for internet connection then show QR
-  if (credsReceived && !qrShown && WiFi.status() == WL_CONNECTED) {
+  // Just report connection status, don't show QR yet
+  if (credsReceived && WiFi.status() == WL_CONNECTED) {
     static bool reportedConnecting = false;
     if (!reportedConnecting) {
       Serial.printf("Connected to SSID: %s\n", prov_ssid.c_str());
       Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+      showMessageOnDisplay("WiFi Connected", "Enter product info", TFT_WHITE);
       reportedConnecting = true;
     }
-
-    // Test internet connectivity
-    WiFiClient client;
-    if (client.connect("google.com", 80)) {
-      client.stop();
-      Serial.println("Internet connected, showing Hello QR...");
-      showPaymentQRCode("Waiting...", 0.0);
-      qrShown = true;
-    } else {
-      Serial.println("WiFi connected but no internet access");
-    }
   }
 
-  // Once we are connected to STA, start product server if not started yet
-  if (WiFi.status() == WL_CONNECTED && !productServerRunning) {
+  // Show connection status when connected
+  static bool connectionShown = false;
+  if (WiFi.status() == WL_CONNECTED && !connectionShown) {
     Serial.printf("STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
-    // Start HTTP server on STA IP for product management
-    setupProductServer();
-
-    // Show a message telling user where to connect (on device display)
-    String ipmsg = WiFi.localIP().toString();
-    showMessageOnDisplay("Connected:", ipmsg.c_str(), TFT_WHITE);
-    delay(1500);
-
-    // If we have a previously saved product, show it
-    if (lastProductName.length() > 0 && lastProductPrice > 0.0) {
-      showPaymentQRCode(lastProductName, lastProductPrice);
-    } else {
-      // show product UI instruction
-      showMessageOnDisplay("Open browser to:", ipmsg.c_str(), TFT_WHITE);
-    }
-  }
-
-  // product server handling (works after server.begin())
-  if (productServerRunning) {
-    server.handleClient();
+    connectionShown = true;
   }
 
   // Periodically print WiFi status (non-blocking)
