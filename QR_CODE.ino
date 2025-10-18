@@ -1,11 +1,14 @@
-// ESP32 WiFi provisioning -> captive portal + show QR after 30s
-// Requires: TFT_eSPI and qrcode_espi libraries
-// Uses WebServer, DNSServer, Preferences (ESP32 core)
+// Full sketch: provisioning -> check API key -> show "Pay X to dispense" QR on TFT
+// Requires: TFT_eSPI, qrcode_espi, ArduinoJson
+// Uses: WebServer, DNSServer, Preferences, WiFiClientSecure, HTTPClient
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -37,7 +40,16 @@ const unsigned long SHOW_QR_AFTER = 30000UL; // 30 seconds
 bool captiveRunning = false;
 String availableNetworks = "";
 
-// Dynamic provisioning page with WiFi scan
+// product server state
+bool productServerRunning = false;
+
+// stored last product
+String lastProductName = "";
+String lastProductApiKey = "";
+double lastProductPrice = 0.0;
+
+// ---------- HTML pages ----------
+
 String generateProvisioningPage() {
   String html = R"rawliteral(
 <!doctype html>
@@ -70,7 +82,7 @@ String generateProvisioningPage() {
         <input name="pass" placeholder="Password (leave empty for open)" type="password"><br>
         <button type="submit">Save and Connect</button>
       </form>
-      <p>After submitting, wait ~30 seconds and the QR will be shown on the device.</p>
+      <p>After submitting, wait ~30 seconds and check the device screen for the QR code.</p>
     </div>
   </body>
 </html>
@@ -79,7 +91,49 @@ String generateProvisioningPage() {
   return html;
 }
 
-// Scan WiFi networks and build options
+String generateProductPage(const char* msg = nullptr) {
+  String notice = "";
+  if (msg) {
+    notice = String("<p style='color:green;'>" ) + msg + "</p>";
+  }
+  String html = R"rawliteral(
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Device - Add Product</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;padding:20px;}
+      input{padding:8px;margin:6px 0;width:100%;}
+      button{padding:10px;width:100%;}
+      .card{max-width:420px;margin:auto;}
+      label{font-weight:600;}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Add New Product</h2>
+      )rawliteral";
+  html += notice;
+  html += R"rawliteral(
+      <form method="POST" action="/add">
+        <label>Product name</label><br>
+        <input name="product" placeholder="e.g. Soda can" required><br>
+        <label>API key</label><br>
+        <input name="apikey" placeholder="Your API key" required><br>
+        <button type="submit">Verify & Show Payment QR</button>
+      </form>
+      <p>If verification succeeds, the device screen will show a payment QR with the price.</p>
+    </div>
+  </body>
+</html>
+)rawliteral";
+  return html;
+}
+
+// ---------- WiFi scan ----------
+
 void scanWiFiNetworks() {
   Serial.println("Scanning WiFi networks...");
   int n = WiFi.scanNetworks();
@@ -102,7 +156,84 @@ void scanWiFiNetworks() {
   Serial.printf("Found %d networks\n", n);
 }
 
-// Serve root provisioning page
+// ---------- Display helpers ----------
+
+void showMessageOnDisplay(const char* line1, const char* line2 = nullptr, uint16_t bg = TFT_BLACK) {
+  display.fillScreen(bg);
+  display.setTextSize(2);
+  if (bg == TFT_WHITE) display.setTextColor(TFT_BLACK, bg);
+  else display.setTextColor(TFT_WHITE, bg);
+  display.setCursor(4, 8);
+  display.print(line1);
+  if (line2) {
+    display.setCursor(4, 40);
+    display.print(line2);
+  }
+}
+
+void showAPQRCode() {
+  // White background so black text is visible
+  display.fillScreen(TFT_WHITE);
+
+  // Build WIFI QR payload
+  String wifi_qr;
+  if (strlen(ap_password) > 0) {
+    wifi_qr = "WIFI:T:WPA;S:" + String(ap_ssid) + ";P:" + String(ap_password) + ";;";
+  } else {
+    wifi_qr = "WIFI:T:nopass;S:" + String(ap_ssid) + ";;";
+  }
+
+  // Draw the QR first (the library draws modules in black on white)
+  qrcode.create(wifi_qr.c_str());
+
+  // Now draw the header and SSID on top in black (with white background)
+  display.setTextSize(2);                     // adjust as needed
+  display.setTextColor(TFT_BLACK, TFT_WHITE); // black text, white bg
+  display.setCursor(4, 4);
+  display.print("Scan to Connect");
+
+  display.setTextSize(1);
+  display.setCursor(4, 36);                   // move down a bit
+  display.print(ap_ssid);
+}
+
+// Show payment QR with message "Pay X to dispense [name]"
+void showPaymentQRCode(const String &productName, double price) {
+  // Compose message for QR
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Pay %.2f to dispense %s", price, productName.c_str());
+
+  // White background so black text readable
+  display.fillScreen(TFT_WHITE);
+
+  // Print header + price
+  display.setTextSize(2);
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
+  display.setCursor(4, 4);
+  display.print("Pay to Dispense");
+
+  display.setTextSize(1);
+  display.setCursor(4, 36);
+  display.print(productName);
+
+  // Draw the QR below (adjust positions by moving cursor before drawing)
+  // The qrcode library will draw its QR near top-left; to avoid text overlap,
+  // we can shift the display's scroll or we can draw QR and then overlay text.
+  // Here we'll place text at top then draw QR slightly lower by using a temporary
+  // fill area and qrcode library default (it draws from top-left). To handle
+  // positioning robustly, draw QR then overlay the header text on top.
+  qrcode.create(buf); // draws QR (black modules on white)
+  // Now overlay header so it remains visible (small y offsets)
+  display.setTextSize(2);
+  display.setCursor(4, 4);
+  display.print("Pay to Dispense");
+  display.setTextSize(1);
+  display.setCursor(4, 36);
+  display.print(productName);
+}
+
+// ---------- Web handlers (captive portal) ----------
+
 void handleRoot() {
   scanWiFiNetworks();
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -110,7 +241,6 @@ void handleRoot() {
   server.send(200, "text/html", generateProvisioningPage());
 }
 
-// Handle the form POST to save credentials
 void handleSave() {
   if (server.method() != HTTP_POST) {
     server.send(405, "text/plain", "Method Not Allowed");
@@ -161,14 +291,12 @@ void handleSave() {
   Serial.println("WiFi.begin() called (attempting station connection)");
 }
 
-// Redirect unknown paths to root (captive portal behavior)
 void handleNotFound() {
   String redirect = String("http://") + apIP.toString() + "/";
   server.sendHeader("Location", redirect, true);
   server.send(302, "text/plain", "");
 }
 
-// Help trigger OS captive-portal checks so device pop-up appears
 void handleGenerate204() {
   String redirect = String("http://") + apIP.toString() + "/";
   server.sendHeader("Location", redirect, true);
@@ -184,60 +312,114 @@ void handleNcsi() {
   server.send(302, "text/plain", "");
 }
 
-// Show a small text on TFT
-void showMessageOnDisplay(const char* line1, const char* line2 = nullptr) {
-  display.fillScreen(TFT_BLACK);
-  display.setTextSize(2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setCursor(4, 8);
-  display.print(line1);
-  if (line2) {
-    display.setCursor(4, 40);
-    display.print(line2);
+// ---------- Product server (after STA connected) ----------
+
+void handleProductRoot() {
+  // Serve the product page
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.send(200, "text/html", generateProductPage());
+}
+
+// POST /add -> verify API key by calling external API and show QR if ok
+void handleAddProduct() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
   }
-}
 
-// Create the "Hello world." QR after provisioning delay
-void showQRCodeHello() {
-  display.fillScreen(TFT_BLACK);
-  display.setTextSize(1);
-  display.setTextColor(TFT_WHITE);
-  display.setCursor(4, 4);
-  display.print("QR (Hello world):");
-  qrcode.create("Hello world."); // draws QR to display
-}
+  String product = server.arg("product");
+  String apikey = server.arg("apikey");
 
-// Build and show QR for joining the ESP32 AP
-// Build and show QR for joining the ESP32 AP (with "Scan to Connect" above)
-// Build and show QR for joining the ESP32 AP (white background + black text)
-void showAPQRCode() {
-  // White background so black text is visible
-  display.fillScreen(TFT_WHITE);
+  if (product.length() == 0 || apikey.length() == 0) {
+    server.send(400, "text/plain", "Product and API key required");
+    return;
+  }
 
-  // Build WIFI QR payload
-  String wifi_qr;
-  if (strlen(ap_password) > 0) {
-    wifi_qr = "WIFI:T:WPA;S:" + String(ap_ssid) + ";P:" + String(ap_password) + ";;";
+  // Compose verification URL: change domain/path as needed
+  String verifyUrl = String("https://something.com/api/") + apikey;
+  Serial.printf("Verifying API key via: %s\n", verifyUrl.c_str());
+
+  // Perform HTTPS GET (note: setInsecure() used for simplicity)
+  WiFiClientSecure *client = new WiFiClientSecure();
+  client->setInsecure();
+
+  HTTPClient https;
+  if (!https.begin(*client, verifyUrl)) {
+    Serial.println("HTTPS begin failed");
+    delete client;
+    server.send(500, "text/plain", "Failed to start HTTPS");
+    return;
+  }
+
+  int httpCode = https.GET();
+  String payload = "";
+  if (httpCode > 0) {
+    payload = https.getString();
+    Serial.printf("HTTP %d, payload: %s\n", httpCode, payload.c_str());
   } else {
-    wifi_qr = "WIFI:T:nopass;S:" + String(ap_ssid) + ";;";
+    Serial.printf("HTTPS GET failed, code: %d\n", httpCode);
+  }
+  https.end();
+  delete client;
+
+  if (httpCode != 200) {
+    server.send(502, "text/html", "<html><body><h3>Verification failed</h3><p>External API returned non-200.</p></body></html>");
+    return;
   }
 
-  // Draw the QR first (library will draw its black modules on the white screen)
-  qrcode.create(wifi_qr.c_str());
+  // Parse JSON response
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.println("JSON parse failed");
+    server.send(500, "text/html", "<html><body><h3>Verification failed</h3><p>Invalid JSON from API.</p></body></html>");
+    return;
+  }
 
-  // Now draw the header and SSID on top in black (with white background)
-  display.setTextSize(2);                     // adjust as needed
-  display.setTextColor(TFT_BLACK, TFT_WHITE); // black text, white bg
-  display.setCursor(4, 4);
-  display.print("Scan to Connect");
+  bool success = false;
+  double price = 0.0;
+  if (doc.containsKey("success")) {
+    success = doc["success"].as<bool>();
+  }
+  if (doc.containsKey("price")) {
+  // If price is a string (JSON "price": "12.34"), read as const char*
+  if (doc["price"].is<const char*>()) {
+    const char* s = doc["price"].as<const char*>();
+    price = atof(s); // convert string to double
+  } else {
+    // If price is numeric (JSON "price": 12.34), read as double
+    price = doc["price"].as<double>();
+  }
+}
+  if (!success) {
+    server.send(403, "text/html", "<html><body><h3>Verification failed</h3><p>API said success: false</p></body></html>");
+    return;
+  }
 
-  display.setTextSize(1);
-  display.setCursor(4, 36);                   // move down a bit so it doesn't overlap header
-  display.print(ap_ssid);
+  // Save last product and show QR on device
+  lastProductName = product;
+  lastProductApiKey = apikey;
+  lastProductPrice = price;
+
+  // Persist last product (optional)
+  prefs.begin("product", false);
+  prefs.putString("name", lastProductName);
+  prefs.putString("apikey", lastProductApiKey);
+  prefs.putDouble("price", lastProductPrice);
+  prefs.end();
+
+  // Show payment QR on TFT
+  showPaymentQRCode(lastProductName, lastProductPrice);
+
+  // Respond to client with simple success page
+  String resp = "<html><body><h3>Verified</h3><p>Price: " + String(price, 2) + "</p>"
+                "<p>Check the device screen for the payment QR.</p></body></html>";
+  server.send(200, "text/html", resp);
 }
 
+// ---------- Start AP + captive portal ----------
 
-// Start AP + DNSServer + WebServer for captive portal
 void setupAPandCaptivePortal() {
   Serial.printf("Starting AP: %s\n", ap_ssid);
 
@@ -270,12 +452,34 @@ void setupAPandCaptivePortal() {
   Serial.println("Captive portal started (DNS + HTTP).");
 }
 
+// ---------- Start product server on STA IP ----------
+
+void setupProductServer() {
+  // Stop any previous handlers, re-use same server object
+  server.stop();
+  delay(50);
+
+  // Setup handlers for product UI
+  server.on("/", HTTP_GET, handleProductRoot);
+  server.on("/add", HTTP_POST, handleAddProduct);
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  productServerRunning = true;
+
+  Serial.printf("Product server started at http://%s\n", WiFi.localIP().toString().c_str());
+}
+
+// ---------- Setup & Loop ----------
+
 void setup() {
   Serial.begin(115200);
   delay(100);
 
   Serial.println();
-  Serial.println("Starting provisioning + QR demo...");
+  Serial.println("Starting provisioning + payment QR demo...");
 
   // init display + qrcode library
   display.init();
@@ -294,9 +498,16 @@ void setup() {
   String savedPass = prefs.getString("pass", "");
   prefs.end();
 
+  // load last product (optional)
+  prefs.begin("product", true);
+  lastProductName = prefs.getString("name", "");
+  lastProductApiKey = prefs.getString("apikey", "");
+  lastProductPrice = prefs.getDouble("price", 0.0);
+  prefs.end();
+
   if (savedSsid.length() > 0) {
     Serial.println("Found saved credentials (in NVM). They will be used if you choose to auto-connect.");
-    // If you want to auto-connect at boot (instead of starting AP), you could:
+    // If you want to auto-connect at boot (instead of starting AP), uncomment:
     // WiFi.mode(WIFI_STA); WiFi.begin(savedSsid.c_str(), savedPass.c_str());
   }
 }
@@ -308,22 +519,50 @@ void loop() {
     server.handleClient();
   }
 
-  // If credentials were posted, wait ~30s then show the Hello QR
-  if (credsReceived && !qrShown) {
-    unsigned long now = millis();
-    unsigned long elapsed = now - credsMillis;
-
+  // If credentials were posted, check for internet connection then show QR
+  if (credsReceived && !qrShown && WiFi.status() == WL_CONNECTED) {
     static bool reportedConnecting = false;
     if (!reportedConnecting) {
-      Serial.printf("Attempting connection to SSID: %s\n", prov_ssid.c_str());
+      Serial.printf("Connected to SSID: %s\n", prov_ssid.c_str());
+      Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
       reportedConnecting = true;
     }
 
-    if (elapsed >= SHOW_QR_AFTER) {
-      Serial.println("30s elapsed, showing Hello QR...");
-      showQRCodeHello();
+    // Test internet connectivity
+    WiFiClient client;
+    if (client.connect("google.com", 80)) {
+      client.stop();
+      Serial.println("Internet connected, showing Hello QR...");
+      showPaymentQRCode("Waiting...", 0.0);
       qrShown = true;
+    } else {
+      Serial.println("WiFi connected but no internet access");
     }
+  }
+
+  // Once we are connected to STA, start product server if not started yet
+  if (WiFi.status() == WL_CONNECTED && !productServerRunning) {
+    Serial.printf("STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    // Start HTTP server on STA IP for product management
+    setupProductServer();
+
+    // Show a message telling user where to connect (on device display)
+    String ipmsg = WiFi.localIP().toString();
+    showMessageOnDisplay("Connected:", ipmsg.c_str(), TFT_WHITE);
+    delay(1500);
+
+    // If we have a previously saved product, show it
+    if (lastProductName.length() > 0 && lastProductPrice > 0.0) {
+      showPaymentQRCode(lastProductName, lastProductPrice);
+    } else {
+      // show product UI instruction
+      showMessageOnDisplay("Open browser to:", ipmsg.c_str(), TFT_WHITE);
+    }
+  }
+
+  // product server handling (works after server.begin())
+  if (productServerRunning) {
+    server.handleClient();
   }
 
   // Periodically print WiFi status (non-blocking)
