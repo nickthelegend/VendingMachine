@@ -35,9 +35,11 @@ bool qrShown = false;
 const unsigned long SHOW_QR_AFTER = 30000UL; // 30 seconds
 
 bool captiveRunning = false;
+String availableNetworks = "";
 
-// Simple provisioning page (form)
-const char index_html[] PROGMEM = R"rawliteral(
+// Dynamic provisioning page with WiFi scan
+String generateProvisioningPage() {
+  String html = R"rawliteral(
 <!doctype html>
 <html>
   <head>
@@ -46,7 +48,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
       body{font-family:Arial,Helvetica,sans-serif;padding:20px;}
-      input{padding:8px;margin:6px 0;width:100%;}
+      input,select{padding:8px;margin:6px 0;width:100%;}
       button{padding:10px;width:100%;}
       .card{max-width:420px;margin:auto;}
     </style>
@@ -55,8 +57,15 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="card">
       <h2>Provision Wi-Fi</h2>
       <form method="POST" action="/save">
-        <label>SSID</label><br>
-        <input name="ssid" placeholder="Network name" required><br>
+        <label>Select Network</label><br>
+        <select name="ssid" required>
+          <option value="">Choose a network...</option>
+)rawliteral";
+  
+  html += availableNetworks;
+  
+  html += R"rawliteral(
+        </select><br>
         <label>Password</label><br>
         <input name="pass" placeholder="Password (leave empty for open)" type="password"><br>
         <button type="submit">Save and Connect</button>
@@ -66,12 +75,39 @@ const char index_html[] PROGMEM = R"rawliteral(
   </body>
 </html>
 )rawliteral";
+  
+  return html;
+}
+
+// Scan WiFi networks and build options
+void scanWiFiNetworks() {
+  Serial.println("Scanning WiFi networks...");
+  int n = WiFi.scanNetworks();
+  availableNetworks = "";
+  
+  if (n == 0) {
+    availableNetworks = "<option value=\"\">No networks found</option>";
+  } else {
+    for (int i = 0; i < n; ++i) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() > 0) {
+        availableNetworks += "<option value=\"" + ssid + "\">" + ssid;
+        if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
+          availableNetworks += " 🔒";
+        }
+        availableNetworks += "</option>";
+      }
+    }
+  }
+  Serial.printf("Found %d networks\n", n);
+}
 
 // Serve root provisioning page
 void handleRoot() {
+  scanWiFiNetworks();
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
-  server.send(200, "text/html", index_html);
+  server.send(200, "text/html", generateProvisioningPage());
 }
 
 // Handle the form POST to save credentials
