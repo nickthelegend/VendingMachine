@@ -208,15 +208,13 @@ void showQRCodeHello() {
 }
 
 // Build and show QR for joining the ESP32 AP
+// Build and show QR for joining the ESP32 AP (with "Scan to Connect" above)
+// Build and show QR for joining the ESP32 AP (white background + black text)
 void showAPQRCode() {
-  display.fillScreen(TFT_BLACK);
-  display.setTextSize(1);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setCursor(4, 4);
-  display.print("Scan to join Wi-Fi:");
-  display.setCursor(4, 20);
-  display.print(ap_ssid);
+  // White background so black text is visible
+  display.fillScreen(TFT_WHITE);
 
+  // Build WIFI QR payload
   String wifi_qr;
   if (strlen(ap_password) > 0) {
     wifi_qr = "WIFI:T:WPA;S:" + String(ap_ssid) + ";P:" + String(ap_password) + ";;";
@@ -224,8 +222,20 @@ void showAPQRCode() {
     wifi_qr = "WIFI:T:nopass;S:" + String(ap_ssid) + ";;";
   }
 
+  // Draw the QR first (library will draw its black modules on the white screen)
   qrcode.create(wifi_qr.c_str());
+
+  // Now draw the header and SSID on top in black (with white background)
+  display.setTextSize(2);                     // adjust as needed
+  display.setTextColor(TFT_BLACK, TFT_WHITE); // black text, white bg
+  display.setCursor(4, 4);
+  display.print("Scan to Connect");
+
+  display.setTextSize(1);
+  display.setCursor(4, 36);                   // move down a bit so it doesn't overlap header
+  display.print(ap_ssid);
 }
+
 
 // Start AP + DNSServer + WebServer for captive portal
 void setupAPandCaptivePortal() {
