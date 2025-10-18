@@ -1,23 +1,30 @@
-// ESP32 WiFi provisioning -> show QR after 30s
+// ESP32 WiFi provisioning -> captive portal + show QR after 30s
 // Requires: TFT_eSPI and qrcode_espi libraries
-// Also uses WebServer (built into ESP32 core) and Preferences for persistence
+// Uses WebServer, DNSServer, Preferences (ESP32 core)
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <qrcode_espi.h>
 
+// Display + QR
 TFT_eSPI display = TFT_eSPI();
 QRcode_eSPI qrcode(&display);
 
+// Web + DNS + prefs
 WebServer server(80);
+DNSServer dnsServer;
 Preferences prefs;
 
-const char* ap_ssid = "ESP32-Setup";   // hotspot name
-const char* ap_password = "setup1234"; // optional; make empty "" for open AP
+// AP config
+const char* ap_ssid = "ESP32-Setup";
+const char* ap_password = "setup1234"; // set to "" for open AP
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
 
 // provisioning state
 String prov_ssid = "";
@@ -27,7 +34,9 @@ unsigned long credsMillis = 0;
 bool qrShown = false;
 const unsigned long SHOW_QR_AFTER = 30000UL; // 30 seconds
 
-// HTML served to client (simple form)
+bool captiveRunning = false;
+
+// Simple provisioning page (form)
 const char index_html[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html>
@@ -39,7 +48,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       body{font-family:Arial,Helvetica,sans-serif;padding:20px;}
       input{padding:8px;margin:6px 0;width:100%;}
       button{padding:10px;width:100%;}
-      .card{max-width:400px;margin:auto;}
+      .card{max-width:420px;margin:auto;}
     </style>
   </head>
   <body>
@@ -58,19 +67,20 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// Serve root provisioning page
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.send(200, "text/html", index_html);
 }
 
+// Handle the form POST to save credentials
 void handleSave() {
   if (server.method() != HTTP_POST) {
     server.send(405, "text/plain", "Method Not Allowed");
     return;
   }
 
-  // read form fields
   String s = server.arg("ssid");
   String p = server.arg("pass");
 
@@ -83,9 +93,9 @@ void handleSave() {
   prov_pass = p;
   credsReceived = true;
   credsMillis = millis();
-  qrShown = false; // reset if previously shown
+  qrShown = false;
 
-  // save persistently
+  // persist credentials
   prefs.begin("provision", false);
   prefs.putString("ssid", prov_ssid);
   prefs.putString("pass", prov_pass);
@@ -98,42 +108,47 @@ void handleSave() {
                 "</body></html>";
   server.send(200, "text/html", resp);
 
-  // begin attempting WiFi connection (non-blocking)
-  connectToWiFi(prov_ssid.c_str(), prov_pass.c_str());
-}
+  // begin WiFi connect sequence (non-blocking)
+  // stop captive portal services before switching to STA
+  if (captiveRunning) {
+    dnsServer.stop();
+    server.stop();
+    captiveRunning = false;
+  }
 
-void connectToWiFi(const char* ssid, const char* pass) {
-  Serial.printf("Stopping AP and switching to STA to connect to %s\n", ssid);
-  // stop AP (so device uses station mode)
+  // stop AP and switch to station mode
   WiFi.softAPdisconnect(true);
   delay(200);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
-  Serial.println("WiFi.begin() called");
-  // we will let loop() continue and not block here
+  WiFi.begin(prov_ssid.c_str(), prov_pass.c_str());
+  Serial.println("WiFi.begin() called (attempting station connection)");
 }
 
-void setupAPandServer() {
-  Serial.printf("Starting AP: %s\n", ap_ssid);
-  // Start soft AP (use password or open)
-  if (strlen(ap_password) > 0) {
-    WiFi.softAP(ap_ssid, ap_password);
-  } else {
-    WiFi.softAP(ap_ssid);
-  }
-
-  IPAddress apIP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(apIP);
-
-  // webserver endpoints
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.begin();
-  Serial.println("Web server started on port 80");
+// Redirect unknown paths to root (captive portal behavior)
+void handleNotFound() {
+  String redirect = String("http://") + apIP.toString() + "/";
+  server.sendHeader("Location", redirect, true);
+  server.send(302, "text/plain", "");
 }
 
+// Help trigger OS captive-portal checks so device pop-up appears
+void handleGenerate204() {
+  String redirect = String("http://") + apIP.toString() + "/";
+  server.sendHeader("Location", redirect, true);
+  server.send(302, "text/plain", "");
+}
+void handleHotspotDetect() {
+  server.sendHeader("Location", String("http://") + apIP.toString() + "/", true);
+  server.send(302, "text/plain", "");
+}
+void handleNcsi() {
+  String redirect = String("http://") + apIP.toString() + "/";
+  server.sendHeader("Location", redirect, true);
+  server.send(302, "text/plain", "");
+}
+
+// Show a small text on TFT
 void showMessageOnDisplay(const char* line1, const char* line2 = nullptr) {
   display.fillScreen(TFT_BLACK);
   display.setTextSize(2);
@@ -146,48 +161,68 @@ void showMessageOnDisplay(const char* line1, const char* line2 = nullptr) {
   }
 }
 
+// Create the "Hello world." QR after provisioning delay
 void showQRCodeHello() {
   display.fillScreen(TFT_BLACK);
-  // optional: show small message
   display.setTextSize(1);
   display.setTextColor(TFT_WHITE);
   display.setCursor(4, 4);
   display.print("QR (Hello world):");
-
-  // Create the QR centered on screen.
-  // qrcode.create accepts const char* or String; library handles drawing
-  qrcode.create("Hello world.");
-  // qrcode_espi typically draws QR to the display. If your version requires explicit draw,
-  // check library docs. Most qrcode_espi implementations draw on create().
+  qrcode.create("Hello world."); // draws QR to display
 }
 
+// Build and show QR for joining the ESP32 AP
 void showAPQRCode() {
-  // Clear screen and show small header
   display.fillScreen(TFT_BLACK);
   display.setTextSize(1);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.setCursor(4, 4);
   display.print("Scan to join Wi-Fi:");
-
   display.setCursor(4, 20);
-  display.print(ap_ssid); // shows SSID text
+  display.print(ap_ssid);
 
-  // Build Wi-Fi QR string in the standard format:
-  // WIFI:T:<auth>;S:<SSID>;P:<password>;;
   String wifi_qr;
   if (strlen(ap_password) > 0) {
-    // assume WPA/WPA2 for a non-empty password
     wifi_qr = "WIFI:T:WPA;S:" + String(ap_ssid) + ";P:" + String(ap_password) + ";;";
   } else {
-    // open network (no password). Some scanners prefer T:nopass
     wifi_qr = "WIFI:T:nopass;S:" + String(ap_ssid) + ";;";
   }
 
-  // Create the QR on the display (library draws it)
-  // qrcode.create accepts const char*
   qrcode.create(wifi_qr.c_str());
 }
 
+// Start AP + DNSServer + WebServer for captive portal
+void setupAPandCaptivePortal() {
+  Serial.printf("Starting AP: %s\n", ap_ssid);
+
+  WiFi.mode(WIFI_AP);
+  // configure AP IP and gateway
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+
+  if (strlen(ap_password) > 0) {
+    WiFi.softAP(ap_ssid, ap_password);
+  } else {
+    WiFi.softAP(ap_ssid);
+  }
+
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP().toString());
+
+  // start DNS server to capture all domains
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // webserver handlers
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/generate_204", HTTP_ANY, handleGenerate204);        // Android
+  server.on("/hotspot-detect.html", HTTP_ANY, handleHotspotDetect); // iOS
+  server.on("/ncsi.txt", HTTP_ANY, handleNcsi);                 // Windows
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  captiveRunning = true;
+  Serial.println("Captive portal started (DNS + HTTP).");
+}
 
 void setup() {
   Serial.begin(115200);
@@ -196,16 +231,16 @@ void setup() {
   Serial.println();
   Serial.println("Starting provisioning + QR demo...");
 
-  // init display + qrcode lib
+  // init display + qrcode library
   display.init();
   display.setRotation(0);
   qrcode.init();
 
-  // show initial message
-showAPQRCode();
+  // show QR to join the AP
+  showAPQRCode();
 
-  // start AP and server
-  setupAPandServer();
+  // begin AP + captive portal
+  setupAPandCaptivePortal();
 
   // load saved creds (optional)
   prefs.begin("provision", true);
@@ -214,41 +249,40 @@ showAPQRCode();
   prefs.end();
 
   if (savedSsid.length() > 0) {
-    Serial.println("Found saved credentials. Will attempt to use them after AP (if not replaced).");
-    // If you want to auto-connect on boot instead of showing AP, comment out AP start above
-    // and uncomment the WiFi connect lines below:
-    // WiFi.mode(WIFI_STA);
-    // WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+    Serial.println("Found saved credentials (in NVM). They will be used if you choose to auto-connect.");
+    // If you want to auto-connect at boot (instead of starting AP), you could:
+    // WiFi.mode(WIFI_STA); WiFi.begin(savedSsid.c_str(), savedPass.c_str());
   }
 }
 
 void loop() {
-  // handle http clients while in AP
-  server.handleClient();
+  // DNS + web server handlers (only while captive portal running)
+  if (captiveRunning) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
 
-  // If credentials were posted, we track 30s and show QR after delay
+  // If credentials were posted, wait ~30s then show the Hello QR
   if (credsReceived && !qrShown) {
     unsigned long now = millis();
     unsigned long elapsed = now - credsMillis;
 
-    // Optional: report connection progress to serial once
     static bool reportedConnecting = false;
     if (!reportedConnecting) {
       Serial.printf("Attempting connection to SSID: %s\n", prov_ssid.c_str());
       reportedConnecting = true;
     }
 
-    // After the timeout show the Hello QR
     if (elapsed >= SHOW_QR_AFTER) {
-      Serial.println("30s elapsed, showing QR...");
+      Serial.println("30s elapsed, showing Hello QR...");
       showQRCodeHello();
       qrShown = true;
     }
   }
 
-  // optional: you can check WiFi status and print it (non-blocking)
+  // Periodically print WiFi status (non-blocking)
   static unsigned long stTime = 0;
-  if (millis() - stTime > 5000) { // every 5s
+  if (millis() - stTime > 5000) {
     stTime = millis();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
