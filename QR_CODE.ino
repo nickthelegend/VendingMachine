@@ -141,8 +141,9 @@ void scanWiFiNetworks() {
   int n = WiFi.scanNetworks();
   availableNetworks = "";
   
-  if (n == 0) {
+  if (n <= 0) {
     availableNetworks = "<option value=\"\">No networks found</option>";
+    Serial.printf("WiFi scan failed or no networks found: %d\n", n);
   } else {
     for (int i = 0; i < n; ++i) {
       String ssid = WiFi.SSID(i);
@@ -154,8 +155,8 @@ void scanWiFiNetworks() {
         availableNetworks += "</option>";
       }
     }
+    Serial.printf("Found %d networks\n", n);
   }
-  Serial.printf("Found %d networks\n", n);
 }
 
 // ---------- Display helpers ----------
@@ -312,33 +313,32 @@ void handleAddProduct() {
     return;
   }
 
-  // Compose verification URL
-  String verifyUrl = String("https://merchant.abcxjntuh.in/api/") + apikey;
-  Serial.printf("Verifying API key via: %s\n", verifyUrl.c_str());
-
-  // Perform HTTPS GET (note: setInsecure() used for simplicity)
-  WiFiClientSecure *client = new WiFiClientSecure();
-  client->setInsecure();
-
-  HTTPClient https;
-  if (!https.begin(*client, verifyUrl)) {
-    Serial.println("HTTPS begin failed");
-    delete client;
-    server.send(500, "text/plain", "Failed to start HTTPS");
+  // Use HTTP client to avoid SSL issues
+  HTTPClient http;
+  String httpUrl = String("https://merchant.abcxjntuh.in/api/") + apikey;
+  Serial.printf("Verifying API key via: %s\n", httpUrl.c_str());
+  
+  if (!http.begin(httpUrl)) {
+    Serial.println("HTTP begin failed");
+    server.send(500, "text/plain", "Failed to start HTTP");
     return;
   }
 
-  int httpCode = https.GET();
+  int httpCode = http.GET();
   String payload = "";
   if (httpCode > 0) {
-    payload = https.getString();
+    payload = http.getString();
     Serial.printf("HTTP %d, payload: %s\n", httpCode, payload.c_str());
   } else {
-    Serial.printf("HTTPS GET failed, code: %d\n", httpCode);
+    Serial.printf("HTTP GET failed, code: %d\n", httpCode);
   }
-  https.end();
-  delete client;
+  http.end();
 
+  if (httpCode <= 0) {
+    server.send(502, "text/html", "<html><body><h3>Connection failed</h3><p>Could not connect to API server. Check internet connection.</p></body></html>");
+    return;
+  }
+  
   if (httpCode != 200) {
     server.send(502, "text/html", "<html><body><h3>Verification failed</h3><p>External API returned non-200.</p></body></html>");
     return;
@@ -483,23 +483,7 @@ void setup() {
   display.setRotation(0);
   qrcode.init();
 
-  // Check if we already have complete setup
-  prefs.begin("product", true);
-  String savedDeviceId = prefs.getString("deviceId", "");
-  String savedProductName = prefs.getString("name", "");
-  double savedPrice = prefs.getDouble("price", 0.0);
-  prefs.end();
-
-  if (savedDeviceId.length() > 0 && savedProductName.length() > 0) {
-    // We have complete setup, show payment QR directly
-    setupComplete = true;
-    lastDeviceId = savedDeviceId;
-    lastProductName = savedProductName;
-    lastProductPrice = savedPrice;
-    showPaymentQRCode(lastProductName, lastProductPrice, lastDeviceId);
-    Serial.println("Loaded saved product, showing payment QR");
-    return;
-  }
+  // Always start with captive portal - no auto-loading of saved product data
 
   // show QR to join the AP
   showAPQRCode();
