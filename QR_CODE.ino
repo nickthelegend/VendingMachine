@@ -386,11 +386,12 @@ void handleAddProduct() {
   prefs.end();
 
   // Show payment QR on TFT
+  Serial.printf("Showing payment QR for: %s, price: %.2f, deviceId: %s\n", product.c_str(), price, deviceId.c_str());
   showPaymentQRCode(lastProductName, lastProductPrice, lastDeviceId);
 
   // Mark setup as complete but keep services running to prevent restart
   setupComplete = true;
-  Serial.println("Product setup complete - showing payment QR");
+  Serial.println("Product setup complete - setupComplete flag set to true");
 
   // Respond to client with simple success page
   String resp = "<html><body><h3>Verified</h3><p>Price: " + String(price, 2) + "</p>"
@@ -507,6 +508,11 @@ void setup() {
 void loop() {
   // If setup is complete, just maintain the payment QR display
   if (setupComplete) {
+    static bool loggedComplete = false;
+    if (!loggedComplete) {
+      Serial.println("Setup complete - maintaining payment QR display");
+      loggedComplete = true;
+    }
     delay(1000);
     return;
   }
@@ -517,8 +523,8 @@ void loop() {
     server.handleClient();
   }
 
-  // Just report connection status, don't show QR yet
-  if (credsReceived && WiFi.status() == WL_CONNECTED) {
+  // Just report connection status, don't show QR yet (unless setup is complete)
+  if (credsReceived && WiFi.status() == WL_CONNECTED && !setupComplete) {
     static bool reportedConnecting = false;
     if (!reportedConnecting) {
       Serial.printf("Connected to SSID: %s\n", prov_ssid.c_str());
