@@ -57,6 +57,10 @@ bool wsConnected = false;
 int joinRef = 1;
 int messageRef = 1;
 
+// Dispensing state
+bool isDispensing = false;
+unsigned long dispensingStartTime = 0;
+
 // ---------- HTML pages ----------
 
 String generateProvisioningPage() {
@@ -535,6 +539,9 @@ void handleWebSocketMessage(uint8_t * payload, size_t length) {
       Serial.println("Transaction ID: " + txnId);
       Serial.println("Machine ID: " + machineId);
       Serial.println("=========================");
+      
+      // Start dispensing sequence
+      startDispensing();
     }
   }
 }
@@ -548,6 +555,34 @@ void setupWebSocket() {
   webSocket.beginSSL("lhnbipgsxrvonbblcekw.supabase.co", 443, path);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+}
+
+void startDispensing() {
+  Serial.println("Starting dispensing sequence...");
+  
+  // Show "Payment Done" message
+  showMessageOnDisplay("Payment Done", "Dispensing...", TFT_GREEN);
+  
+  isDispensing = true;
+  dispensingStartTime = millis();
+}
+
+void handleDispensing() {
+  if (!isDispensing) return;
+  
+  unsigned long elapsed = millis() - dispensingStartTime;
+  
+  if (elapsed >= 5000) { // 5 seconds timeout
+    // Show "Dispensing Off" message
+    showMessageOnDisplay("Dispensing Off", "", TFT_RED);
+    delay(2000); // Show for 2 seconds
+    
+    // Return to payment QR
+    showPaymentQRCode(lastProductName, lastProductPrice, lastDeviceId);
+    
+    isDispensing = false;
+    Serial.println("Dispensing sequence completed");
+  }
 }
 
 // ---------- Clear saved data ----------
@@ -609,6 +644,7 @@ void loop() {
       loggedComplete = true;
     }
     webSocket.loop();
+    handleDispensing();
     delay(100);
     return;
   }
