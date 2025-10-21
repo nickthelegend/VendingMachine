@@ -9,6 +9,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <WebSocketsClient.h>
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -49,6 +50,12 @@ String lastProductName = "";
 String lastProductApiKey = "";
 double lastProductPrice = 0.0;
 String lastDeviceId = "";
+
+// WebSocket
+WebSocketsClient webSocket;
+bool wsConnected = false;
+int joinRef = 1;
+int messageRef = 1;
 
 // ---------- HTML pages ----------
 
@@ -392,6 +399,9 @@ void handleAddProduct() {
   // Mark setup as complete but keep services running to prevent restart
   setupComplete = true;
   Serial.println("Product setup complete - setupComplete flag set to true");
+  
+  // Start WebSocket connection for payment listening
+  setupWebSocket();
 
   // Respond to client with simple success page
   String resp = "<html><body><h3>Verified</h3><p>Price: " + String(price, 2) + "</p>"
@@ -455,6 +465,91 @@ void setupProductServer() {
   Serial.printf("Product server started at http://%s\n", WiFi.localIP().toString().c_str());
 }
 
+// ---------- WebSocket Functions ----------
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WSc] Disconnected!");
+      wsConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.println("[WSc] Connected to Supabase!");
+      wsConnected = true;
+      subscribeToPaymentChannel();
+      break;
+      
+    case WStype_TEXT:
+      handleWebSocketMessage(payload, length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.println("[WSc] Connection error!");
+      break;
+  }
+}
+
+void subscribeToPaymentChannel() {
+  if (lastDeviceId.length() == 0) return;
+  
+  StaticJsonDocument<512> doc;
+  doc["topic"] = "realtime:machine-" + lastDeviceId;
+  doc["event"] = "phx_join";
+  doc["join_ref"] = String(joinRef);
+  doc["ref"] = String(messageRef);
+  
+  JsonObject payload = doc.createNestedObject("payload");
+  JsonObject config = payload.createNestedObject("config");
+  JsonObject broadcast = config.createNestedObject("broadcast");
+  broadcast["self"] = true;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  Serial.println("[WSc] Subscribing to payment channel: " + lastDeviceId);
+  webSocket.sendTXT(jsonString);
+  
+  joinRef++;
+  messageRef++;
+}
+
+void handleWebSocketMessage(uint8_t * payload, size_t length) {
+  String message = String((char*)payload);
+  Serial.println("[WSc] Received: " + message);
+  
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, message) != DeserializationError::Ok) return;
+  
+  String event = doc["event"];
+  
+  if (event == "broadcast") {
+    JsonObject broadcastPayload = doc["payload"];
+    String eventName = broadcastPayload["event"];
+    
+    if (eventName == "payment_approved") {
+      String txnId = broadcastPayload["payload"]["txnId"];
+      String machineId = broadcastPayload["payload"]["machineId"];
+      
+      Serial.println("=== PAYMENT APPROVED ===");
+      Serial.println("Transaction ID: " + txnId);
+      Serial.println("Machine ID: " + machineId);
+      Serial.println("=========================");
+    }
+  }
+}
+
+void setupWebSocket() {
+  if (lastDeviceId.length() == 0) return;
+  
+  String path = "/realtime/v1/websocket?apikey=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxobmJpcGdzeHJ2b25iYmxjZWt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA3NTc5NDgsImV4cCI6MjA3NjMzMzk0OH0.N4oalFAo-1TpjrU12bZ7PHNLwMhD2S3rHe339AW_m3M&log_level=info&vsn=1.0.0";
+  
+  Serial.println("Setting up WebSocket for device: " + lastDeviceId);
+  webSocket.beginSSL("lhnbipgsxrvonbblcekw.supabase.co", 443, path);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+}
+
 // ---------- Clear saved data ----------
 
 void clearSavedData() {
@@ -506,14 +601,15 @@ void setup() {
 }
 
 void loop() {
-  // If setup is complete, just maintain the payment QR display
+  // If setup is complete, handle WebSocket and maintain payment QR display
   if (setupComplete) {
     static bool loggedComplete = false;
     if (!loggedComplete) {
       Serial.println("Setup complete - maintaining payment QR display");
       loggedComplete = true;
     }
-    delay(1000);
+    webSocket.loop();
+    delay(100);
     return;
   }
 
