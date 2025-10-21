@@ -39,6 +39,7 @@ const unsigned long SHOW_QR_AFTER = 30000UL; // 30 seconds
 
 bool captiveRunning = false;
 String availableNetworks = "";
+bool setupComplete = false;
 
 // product server state
 bool productServerRunning = false;
@@ -47,6 +48,7 @@ bool productServerRunning = false;
 String lastProductName = "";
 String lastProductApiKey = "";
 double lastProductPrice = 0.0;
+String lastDeviceId = "";
 
 // ---------- HTML pages ----------
 
@@ -197,36 +199,23 @@ void showAPQRCode() {
   display.print(ap_ssid);
 }
 
-// Show payment QR with message "Pay X to dispense [name]"
-void showPaymentQRCode(const String &productName, double price) {
-  // Compose message for QR
-  char buf[128];
-  snprintf(buf, sizeof(buf), "Pay %.2f to dispense %s", price, productName.c_str());
+// Show payment QR with website URL
+void showPaymentQRCode(const String &productName, double price, const String &deviceId) {
+  // Create payment URL
+  String paymentUrl = "https://vendchain.abcxjntuh.in/pay/" + deviceId;
 
   // White background so black text readable
   display.fillScreen(TFT_WHITE);
 
-  // Print header + price
+  // Draw the QR code with payment URL
+  qrcode.create(paymentUrl.c_str());
+
+  // Overlay header text
   display.setTextSize(2);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.setCursor(4, 4);
-  display.print("Pay to Dispense");
+  display.print("Scan to Pay");
 
-  display.setTextSize(1);
-  display.setCursor(4, 36);
-  display.print(productName);
-
-  // Draw the QR below (adjust positions by moving cursor before drawing)
-  // The qrcode library will draw its QR near top-left; to avoid text overlap,
-  // we can shift the display's scroll or we can draw QR and then overlay text.
-  // Here we'll place text at top then draw QR slightly lower by using a temporary
-  // fill area and qrcode library default (it draws from top-left). To handle
-  // positioning robustly, draw QR then overlay the header text on top.
-  qrcode.create(buf); // draws QR (black modules on white)
-  // Now overlay header so it remains visible (small y offsets)
-  display.setTextSize(2);
-  display.setCursor(4, 4);
-  display.print("Pay to Dispense");
   display.setTextSize(1);
   display.setCursor(4, 36);
   display.print(productName);
@@ -323,8 +312,8 @@ void handleAddProduct() {
     return;
   }
 
-  // Compose verification URL: change domain/path as needed
-  String verifyUrl = String("https://something.com/api/") + apikey;
+  // Compose verification URL
+  String verifyUrl = String("https://merchant.abcxjntuh.in/api/") + apikey;
   Serial.printf("Verifying API key via: %s\n", verifyUrl.c_str());
 
   // Perform HTTPS GET (note: setInsecure() used for simplicity)
@@ -366,19 +355,17 @@ void handleAddProduct() {
 
   bool success = false;
   double price = 0.0;
+  String deviceId = "";
+  
   if (doc.containsKey("success")) {
     success = doc["success"].as<bool>();
   }
   if (doc.containsKey("price")) {
-  // If price is a string (JSON "price": "12.34"), read as const char*
-  if (doc["price"].is<const char*>()) {
-    const char* s = doc["price"].as<const char*>();
-    price = atof(s); // convert string to double
-  } else {
-    // If price is numeric (JSON "price": 12.34), read as double
     price = doc["price"].as<double>();
   }
-}
+  if (doc.containsKey("deviceId")) {
+    deviceId = doc["deviceId"].as<String>();
+  }
   if (!success) {
     server.send(403, "text/html", "<html><body><h3>Verification failed</h3><p>API said success: false</p></body></html>");
     return;
@@ -388,23 +375,22 @@ void handleAddProduct() {
   lastProductName = product;
   lastProductApiKey = apikey;
   lastProductPrice = price;
+  lastDeviceId = deviceId;
 
   // Persist last product (optional)
   prefs.begin("product", false);
   prefs.putString("name", lastProductName);
   prefs.putString("apikey", lastProductApiKey);
   prefs.putDouble("price", lastProductPrice);
+  prefs.putString("deviceId", lastDeviceId);
   prefs.end();
 
   // Show payment QR on TFT
-  showPaymentQRCode(lastProductName, lastProductPrice);
+  showPaymentQRCode(lastProductName, lastProductPrice, lastDeviceId);
 
-  // Now close the captive portal since we're done
-  if (captiveRunning) {
-    dnsServer.stop();
-    captiveRunning = false;
-    Serial.println("Captive portal closed after product setup");
-  }
+  // Mark setup as complete but keep services running to prevent restart
+  setupComplete = true;
+  Serial.println("Product setup complete - showing payment QR");
 
   // Respond to client with simple success page
   String resp = "<html><body><h3>Verified</h3><p>Price: " + String(price, 2) + "</p>"
@@ -468,6 +454,21 @@ void setupProductServer() {
   Serial.printf("Product server started at http://%s\n", WiFi.localIP().toString().c_str());
 }
 
+// ---------- Clear saved data ----------
+
+void clearSavedData() {
+  prefs.begin("provision", false);
+  prefs.clear();
+  prefs.end();
+  
+  prefs.begin("product", false);
+  prefs.clear();
+  prefs.end();
+  
+  Serial.println("All saved data cleared. Restarting...");
+  ESP.restart();
+}
+
 // ---------- Setup & Loop ----------
 
 void setup() {
@@ -482,23 +483,34 @@ void setup() {
   display.setRotation(0);
   qrcode.init();
 
+  // Check if we already have complete setup
+  prefs.begin("product", true);
+  String savedDeviceId = prefs.getString("deviceId", "");
+  String savedProductName = prefs.getString("name", "");
+  double savedPrice = prefs.getDouble("price", 0.0);
+  prefs.end();
+
+  if (savedDeviceId.length() > 0 && savedProductName.length() > 0) {
+    // We have complete setup, show payment QR directly
+    setupComplete = true;
+    lastDeviceId = savedDeviceId;
+    lastProductName = savedProductName;
+    lastProductPrice = savedPrice;
+    showPaymentQRCode(lastProductName, lastProductPrice, lastDeviceId);
+    Serial.println("Loaded saved product, showing payment QR");
+    return;
+  }
+
   // show QR to join the AP
   showAPQRCode();
 
   // begin AP + captive portal
   setupAPandCaptivePortal();
 
-  // load saved creds (optional)
+  // load saved WiFi credentials
   prefs.begin("provision", true);
   String savedSsid = prefs.getString("ssid", "");
   String savedPass = prefs.getString("pass", "");
-  prefs.end();
-
-  // load last product (optional)
-  prefs.begin("product", true);
-  lastProductName = prefs.getString("name", "");
-  lastProductApiKey = prefs.getString("apikey", "");
-  lastProductPrice = prefs.getDouble("price", 0.0);
   prefs.end();
 
   if (savedSsid.length() > 0) {
@@ -509,6 +521,12 @@ void setup() {
 }
 
 void loop() {
+  // If setup is complete, just maintain the payment QR display
+  if (setupComplete) {
+    delay(1000);
+    return;
+  }
+
   // DNS + web server handlers (only while captive portal running)
   if (captiveRunning) {
     dnsServer.processNextRequest();
@@ -531,16 +549,5 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && !connectionShown) {
     Serial.printf("STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
     connectionShown = true;
-  }
-
-  // Periodically print WiFi status (non-blocking)
-  static unsigned long stTime = 0;
-  if (millis() - stTime > 5000) {
-    stTime = millis();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-      Serial.printf("WiFi.status() = %d\n", WiFi.status());
-    }
   }
 }
