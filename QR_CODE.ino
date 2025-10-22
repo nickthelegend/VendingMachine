@@ -60,6 +60,7 @@ int messageRef = 1;
 // Dispensing state
 bool isDispensing = false;
 unsigned long dispensingStartTime = 0;
+const int relayPin = 22; // GPIO22 connected to relay module
 
 // ---------- HTML pages ----------
 
@@ -563,8 +564,17 @@ void startDispensing() {
   // Show "Payment Done" message
   showMessageOnDisplay("Payment Done", "Dispensing...", TFT_GREEN);
   
+  // Turn motor ON (LOW = ON for active LOW relay)
+  digitalWrite(relayPin, LOW);
+  Serial.println("Motor ON - Dispensing started");
+  
   isDispensing = true;
   dispensingStartTime = millis();
+}
+
+void stopMotor() {
+  digitalWrite(relayPin, HIGH); // HIGH = OFF for active LOW relay
+  Serial.println("Motor forcibly stopped");
 }
 
 void handleDispensing() {
@@ -572,7 +582,11 @@ void handleDispensing() {
   
   unsigned long elapsed = millis() - dispensingStartTime;
   
-  if (elapsed >= 5000) { // 5 seconds timeout
+  if (elapsed >= 9000) { // 9 seconds timeout
+    // Turn motor OFF (HIGH = OFF for active LOW relay)
+    digitalWrite(relayPin, HIGH);
+    Serial.println("Motor OFF - Dispensing stopped");
+    
     // Show "Dispensing Off" message
     showMessageOnDisplay("Dispensing Off", "", TFT_RED);
     delay(2000); // Show for 2 seconds
@@ -613,6 +627,13 @@ void setup() {
   display.init();
   display.setRotation(0);
   qrcode.init();
+  
+  // init relay pin - ensure motor is OFF (active LOW relay)
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH); // Motor OFF initially (HIGH = OFF for active LOW relay)
+  delay(100);
+  digitalWrite(relayPin, HIGH); // Double ensure motor is OFF
+  Serial.println("Motor initialized - OFF state (active LOW relay)");
 
   // Always start with captive portal - no auto-loading of saved product data
 
@@ -641,6 +662,8 @@ void loop() {
     static bool loggedComplete = false;
     if (!loggedComplete) {
       Serial.println("Setup complete - maintaining payment QR display");
+      // Ensure motor is OFF when setup completes (HIGH = OFF for active LOW relay)
+      digitalWrite(relayPin, HIGH);
       loggedComplete = true;
     }
     webSocket.loop();
