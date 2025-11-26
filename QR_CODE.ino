@@ -62,6 +62,33 @@ bool isDispensing = false;
 unsigned long dispensingStartTime = 0;
 const int relayPin = 22; // GPIO22 connected to relay module
 
+// ---------- Blockchain Configuration ----------
+
+struct ChainConfig {
+  String name;
+  String supabaseUrl;
+  String supabaseAnonKey;
+  String merchantApiBase;
+  String paymentUrlBase;
+};
+
+// Global blockchain configurations
+ChainConfig algorandConfig;
+ChainConfig cardanoConfig;
+ChainConfig* activeChain = nullptr;
+
+// Display rotation setting (0 or 2 for 0° or 180°)
+// Default to 180° (value 2) because hardware is assembled upside down
+int displayRotation = 2;
+
+// ---------- Forward Declarations ----------
+
+void setActiveChain(String chainName);
+void setupWebSocket();
+void subscribeToPaymentChannel();
+void handleWebSocketMessage(uint8_t * payload, size_t length);
+void startDispensing();
+
 // ---------- HTML pages ----------
 
 String generateProvisioningPage() {
@@ -77,6 +104,9 @@ String generateProvisioningPage() {
       input,select{padding:8px;margin:6px 0;width:100%;}
       button{padding:10px;width:100%;}
       .card{max-width:420px;margin:auto;}
+      label{font-weight:600;}
+      .checkbox-container{margin:10px 0;}
+      .checkbox-container input[type="checkbox"]{width:auto;margin-right:8px;}
     </style>
   </head>
   <body>
@@ -94,6 +124,26 @@ String generateProvisioningPage() {
         </select><br>
         <label>Password</label><br>
         <input name="pass" placeholder="Password (leave empty for open)" type="password"><br>
+        
+        <label>Blockchain Network</label><br>
+        <select name="chain" required>
+          <option value="algorand")rawliteral";
+  
+  // Add selected attribute for current active chain
+  if (activeChain && activeChain->name == "algorand") {
+    html += R"rawliteral( selected)rawliteral";
+  }
+  
+  html += R"rawliteral(">Algorand</option>
+          <option value="cardano")rawliteral";
+  
+  if (activeChain && activeChain->name == "cardano") {
+    html += R"rawliteral( selected)rawliteral";
+  }
+  
+  html += R"rawliteral(">Cardano</option>
+        </select><br>
+        
         <button type="submit">Save and Connect</button>
       </form>
       <p>After submitting, wait ~30 seconds and check the device screen for the QR code.</p>
@@ -171,9 +221,114 @@ void scanWiFiNetworks() {
   }
 }
 
+// ---------- Blockchain Configuration Functions ----------
+
+void initChainConfigs() {
+  // Initialize Algorand configuration (existing values)
+  algorandConfig.name = "algorand";
+  algorandConfig.supabaseUrl = "lhnbipgsxrvonbblcekw.supabase.co";
+  algorandConfig.supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxobmJpcGdzeHJ2b25iYmxjZWt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA3NTc5NDgsImV4cCI6MjA3NjMzMzk0OH0.N4oalFAo-1TpjrU12bZ7PHNLwMhD2S3rHe339AW_m3M";
+  algorandConfig.merchantApiBase = "merchant.abcxjntuh.in/api/";
+  algorandConfig.paymentUrlBase = "vendchain.abcxjntuh.in/pay/";
+
+  // Initialize Cardano configuration (new values from requirements)
+  cardanoConfig.name = "cardano";
+  cardanoConfig.supabaseUrl = "ifxllaqnfvupxhsxtscs.supabase.co";
+  cardanoConfig.supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmeGxsYXFuZnZ1cHhoc3h0c2NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMxMzgwMDIsImV4cCI6MjA3ODcxNDAwMn0.cSSdVNa2biPFbni5sufmSdTn67CDaefo0I2AdElaMzM";
+  cardanoConfig.merchantApiBase = "cardano-vending-merchant.vercel.app/api/";
+  cardanoConfig.paymentUrlBase = "cardano-vending-machine.vercel.app/pay/";
+
+  // Set Algorand as default active chain
+  activeChain = &algorandConfig;
+  
+  Serial.println("Blockchain configurations initialized");
+  Serial.println("Active chain: " + activeChain->name);
+}
+
+// ---------- Settings Persistence Functions ----------
+
+void loadSettings() {
+  prefs.begin("settings", true); // read-only mode
+  
+  // Load blockchain selection (default to "algorand")
+  String chainName = prefs.getString("chain", "algorand");
+  
+  // Load display rotation (default to 2 = 180° because hardware is assembled upside down)
+  displayRotation = prefs.getInt("rotation", 2);
+  
+  prefs.end();
+  
+  // Set active chain based on loaded setting
+  setActiveChain(chainName);
+  
+  Serial.println("Settings loaded:");
+  Serial.println("  Chain: " + chainName);
+  Serial.println("  Rotation: " + String(displayRotation));
+}
+
+void saveSettings() {
+  prefs.begin("settings", false); // read-write mode
+  
+  // Save current blockchain selection
+  prefs.putString("chain", activeChain->name);
+  
+  // Save current display rotation
+  prefs.putInt("rotation", displayRotation);
+  
+  prefs.end();
+  
+  Serial.println("Settings saved:");
+  Serial.println("  Chain: " + activeChain->name);
+  Serial.println("  Rotation: " + String(displayRotation));
+}
+
+void setActiveChain(String chainName) {
+  if (chainName == "cardano") {
+    activeChain = &cardanoConfig;
+  } else {
+    // Default to Algorand for any invalid or unrecognized chain name
+    activeChain = &algorandConfig;
+  }
+  
+  Serial.println("Active chain set to: " + activeChain->name);
+}
+
+// ---------- API Endpoint Helper Functions ----------
+
+String getMerchantApiUrl(String apiKey) {
+  return String("https://") + activeChain->merchantApiBase + apiKey;
+}
+
+String getPaymentUrl(String deviceId) {
+  return String("https://") + activeChain->paymentUrlBase + deviceId;
+}
+
+// ---------- Display Rotation Management Functions ----------
+
+void initDisplay() {
+  display.init();
+  display.setRotation(displayRotation);
+  Serial.println("Display initialized with rotation: " + String(displayRotation));
+}
+
+void setDisplayRotation(int rotation) {
+  // Validate rotation value (only allow 0 or 2)
+  if (rotation != 0 && rotation != 2) {
+    Serial.println("Invalid rotation value: " + String(rotation) + ". Using default 0.");
+    rotation = 0;
+  }
+  
+  displayRotation = rotation;
+  display.setRotation(displayRotation);
+  Serial.println("Display rotation set to: " + String(displayRotation));
+}
+
 // ---------- Display helpers ----------
 
 void showMessageOnDisplay(const char* line1, const char* line2 = nullptr, uint16_t bg = TFT_BLACK) {
+  // Apply rotation setting
+  display.setRotation(displayRotation);
+  
   display.fillScreen(bg);
   display.setTextSize(2);
   if (bg == TFT_WHITE) display.setTextColor(TFT_BLACK, bg);
@@ -187,6 +342,9 @@ void showMessageOnDisplay(const char* line1, const char* line2 = nullptr, uint16
 }
 
 void showAPQRCode() {
+  // Apply rotation setting
+  display.setRotation(displayRotation);
+  
   // White background so black text is visible
   display.fillScreen(TFT_WHITE);
 
@@ -214,8 +372,11 @@ void showAPQRCode() {
 
 // Show payment QR with website URL
 void showPaymentQRCode(const String &productName, double price, const String &deviceId) {
+  // Apply rotation setting
+  display.setRotation(displayRotation);
+  
   // Create payment URL
-  String paymentUrl = "https://vendchain.abcxjntuh.in/pay/" + deviceId;
+  String paymentUrl = getPaymentUrl(deviceId);
 
   // White background so black text readable
   display.fillScreen(TFT_WHITE);
@@ -251,9 +412,15 @@ void handleSave() {
 
   String s = server.arg("ssid");
   String p = server.arg("pass");
+  String chain = server.arg("chain");
 
   if (s.length() == 0) {
     server.send(400, "text/plain", "SSID required");
+    return;
+  }
+
+  if (chain.length() == 0) {
+    server.send(400, "text/plain", "Blockchain selection required");
     return;
   }
 
@@ -263,11 +430,24 @@ void handleSave() {
   credsMillis = millis();
   qrShown = false;
 
+  // Process blockchain selection
+  setActiveChain(chain);
+  
+  // Display rotation is fixed at 180° (hardware is assembled upside down)
+  displayRotation = 2;
+
   // persist credentials
   prefs.begin("provision", false);
   prefs.putString("ssid", prov_ssid);
   prefs.putString("pass", prov_pass);
   prefs.end();
+
+  // Save blockchain and rotation settings
+  saveSettings();
+
+  Serial.println("Settings updated:");
+  Serial.println("  Chain: " + activeChain->name);
+  Serial.println("  Rotation: " + String(displayRotation));
 
   // respond to client - redirect to product page
   String redirect = String("http://") + apIP.toString() + "/product";
@@ -327,7 +507,7 @@ void handleAddProduct() {
 
   // Use HTTP client to avoid SSL issues
   HTTPClient http;
-  String httpUrl = String("https://merchant.abcxjntuh.in/api/") + apikey;
+  String httpUrl = getMerchantApiUrl(apikey);
   Serial.printf("Verifying API key via: %s\n", httpUrl.c_str());
   
   if (!http.begin(httpUrl)) {
@@ -550,10 +730,11 @@ void handleWebSocketMessage(uint8_t * payload, size_t length) {
 void setupWebSocket() {
   if (lastDeviceId.length() == 0) return;
   
-  String path = "/realtime/v1/websocket?apikey=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxobmJpcGdzeHJ2b25iYmxjZWt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA3NTc5NDgsImV4cCI6MjA3NjMzMzk0OH0.N4oalFAo-1TpjrU12bZ7PHNLwMhD2S3rHe339AW_m3M&log_level=info&vsn=1.0.0";
+  String path = "/realtime/v1/websocket?apikey=" + activeChain->supabaseAnonKey + "&log_level=info&vsn=1.0.0";
   
   Serial.println("Setting up WebSocket for device: " + lastDeviceId);
-  webSocket.beginSSL("lhnbipgsxrvonbblcekw.supabase.co", 443, path);
+  Serial.println("Using Supabase: " + activeChain->supabaseUrl);
+  webSocket.beginSSL(activeChain->supabaseUrl.c_str(), 443, path);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
 }
@@ -623,9 +804,14 @@ void setup() {
   Serial.println();
   Serial.println("Starting provisioning + payment QR demo...");
 
+  // Initialize blockchain configurations
+  initChainConfigs();
+  
+  // Load saved settings (blockchain selection and display rotation)
+  loadSettings();
+
   // init display + qrcode library
-  display.init();
-  display.setRotation(0);
+  initDisplay(); // This will apply the saved rotation setting
   qrcode.init();
   
   // init relay pin - ensure motor is OFF (active LOW relay)
